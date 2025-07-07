@@ -510,54 +510,9 @@ where
       })
       .collect();
 
-    // Collect CSS modules dependencies from the `composes` property.
+    // Collect CSS modules dependencies from the `composes` property and variable references.
     let css_modules_deps: Result<Vec<u32>, _> = if self.options.css_modules.is_some() {
-      stylesheet
-        .rules
-        .0
-        .par_iter_mut()
-        .filter_map(|r| {
-          if let CssRule::Style(style) = r {
-            Some(
-              style
-                .declarations
-                .declarations
-                .par_iter_mut()
-                .chain(style.declarations.important_declarations.par_iter_mut())
-                .filter_map(|d| match d {
-                  Property::Composes(composes) => self
-                    .add_css_module_dep(file, &rule, style.loc, composes.loc, &mut composes.from)
-                    .map(|result| rayon::iter::Either::Left(rayon::iter::once(result))),
-
-                  // Handle variable references if the dashed_idents option is present.
-                  Property::Custom(CustomProperty { value, .. })
-                  | Property::Unparsed(UnparsedProperty { value, .. })
-                    if matches!(&self.options.css_modules, Some(css_modules) if css_modules.dashed_idents) =>
-                  {
-                    Some(rayon::iter::Either::Right(visit_vars(value).filter_map(|name| {
-                      self.add_css_module_dep(
-                        file,
-                        &rule,
-                        style.loc,
-                        // TODO: store loc in variable reference?
-                        crate::dependencies::Location {
-                          line: style.loc.line,
-                          column: style.loc.column,
-                        },
-                        &mut name.from,
-                      )
-                    })))
-                  }
-                  _ => None,
-                })
-                .flatten(),
-            )
-          } else {
-            None
-          }
-        })
-        .flatten()
-        .collect()
+      collect_rules_dependencies(&mut stylesheet.rules.0, file, &rule, self, true)
     } else {
       Ok(vec![])
     };
@@ -788,6 +743,9 @@ fn visit_vars<'a, 'b>(
             stack.push(dark.0.iter_mut());
           }
         },
+        Some(TokenOrValue::Function(func)) => {
+          stack.push(func.arguments.0.iter_mut());
+        }
         None => {
           stack.pop();
         }
@@ -797,6 +755,178 @@ fn visit_vars<'a, 'b>(
     None
   })
   .par_bridge()
+}
+
+fn visit_container_condition_vars<'a, 'b>(
+  condition: &'b mut crate::rules::container::ContainerCondition<'a>,
+) -> Vec<&'b mut DashedIdentReference<'a>> {
+  let mut vars = Vec::new();
+
+  fn collect_vars<'a, 'b>(
+    condition: &'b mut crate::rules::container::ContainerCondition<'a>,
+    vars: &mut Vec<&'b mut DashedIdentReference<'a>>,
+  ) {
+    use crate::rules::container::ContainerCondition;
+
+    match condition {
+      ContainerCondition::Style(style_query) => visit_style_query_vars(style_query, vars),
+      ContainerCondition::Not(inner) => collect_vars(inner, vars),
+      ContainerCondition::Operation { conditions, .. } => for cond in conditions { collect_vars(cond, vars) },
+      ContainerCondition::Feature(_) => (), // Size features can’t contain variables yet
+    }
+  }
+
+  collect_vars(condition, &mut vars);
+  vars
+}
+
+fn visit_style_query_vars<'a, 'b>(
+  query: &'b mut crate::rules::container::StyleQuery<'a>,
+  vars: &mut Vec<&'b mut DashedIdentReference<'a>>,
+) {
+  use crate::rules::container::StyleQuery;
+  use crate::properties::{Property, custom::{CustomProperty, UnparsedProperty}};
+
+  match query {
+    StyleQuery::Declaration(property) => match property {
+      Property::Custom(CustomProperty { value, .. }) | Property::Unparsed(UnparsedProperty { value, .. }) => {
+        vars.extend(visit_vars(value).collect::<Vec<_>>());
+      }
+      _ => {}
+    },
+    StyleQuery::Not(inner) => visit_style_query_vars(inner, vars),
+    StyleQuery::Operation { conditions, .. } => for cond in conditions { visit_style_query_vars(cond, vars) },
+    StyleQuery::Property(_) => (),
+  }
+}
+
+fn collect_declaration_dependencies<'a, P: SourceProvider, T: AtRuleParser<'a> + Clone + Sync + Send>(
+  declarations: &mut crate::declaration::DeclarationBlock<'a>,
+  file: &Path,
+  import_rule: &ImportRule<'a>,
+  bundler: &Bundler<'a, '_, '_, P, T>,
+  loc: Location,
+  collect_composes: bool,
+  has_dashed_idents: bool,
+) -> Result<Vec<u32>, Error<BundleErrorKind<'a, P::Error>>>
+where
+  T::AtRule: Sync + Send + ToCss + Clone,
+{
+  declarations
+    .declarations
+    .par_iter_mut()
+    .chain(declarations.important_declarations.par_iter_mut())
+    .filter_map(|property| match property {
+      Property::Composes(composes) if collect_composes => bundler
+        .add_css_module_dep(file, import_rule, loc, composes.loc, &mut composes.from)
+        .map(|result| rayon::iter::Either::Left(rayon::iter::once(result))),
+
+      // Handle variable references if the dashed_idents option is present.
+      Property::Custom(CustomProperty { value, .. }) | Property::Unparsed(UnparsedProperty { value, .. })
+        if has_dashed_idents =>
+      {
+        Some(rayon::iter::Either::Right(visit_vars(value).filter_map(|name| {
+          bundler.add_css_module_dep(
+            file,
+            import_rule,
+            loc,
+            // TODO: store loc in variable reference?
+            crate::dependencies::Location {
+              line: loc.line,
+              column: loc.column,
+            },
+            &mut name.from,
+          )
+        })))
+      }
+      _ => None,
+    })
+    .flatten()
+    .collect()
+}
+
+// Recursively collects dependencies from a set of rules.
+fn collect_rules_dependencies<'a, P: SourceProvider, T: AtRuleParser<'a> + Clone + Sync + Send>(
+  rules: &mut [CssRule<'a, T::AtRule>],
+  file: &Path,
+  import_rule: &ImportRule<'a>,
+  bundler: &Bundler<'a, '_, '_, P, T>,
+  collect_composes: bool,
+) -> Result<Vec<u32>, Error<BundleErrorKind<'a, P::Error>>>
+where
+  T::AtRule: Sync + Send + ToCss + Clone,
+{
+  let has_dashed_idents = matches!(&bundler.options.css_modules, Some(css_modules) if css_modules.dashed_idents);
+
+  macro_rules! collect_nested_deps {
+    ($deps:expr, $rules:expr) => {
+      if has_dashed_idents && !$rules.0.is_empty() {
+        $deps.extend(collect_rules_dependencies(&mut $rules.0, file, import_rule, bundler, false)?)
+      }
+    };
+  }
+
+  macro_rules! collect_decl_deps {
+    ($deps:expr, $declarations:expr, $loc:expr, $collect_composes:expr) => {
+      $deps.extend(collect_declaration_dependencies(
+        $declarations,
+        file,
+        import_rule,
+        bundler,
+        $loc,
+        $collect_composes,
+        has_dashed_idents,
+      )?)
+    };
+  }
+
+  Ok(
+    rules
+      .par_iter_mut()
+      .map(|rule| -> Result<Vec<u32>, Error<BundleErrorKind<'a, P::Error>>> {
+        let mut deps = Vec::new();
+        if let CssRule::Style(style) = rule {
+          collect_decl_deps!(deps, &mut style.declarations, style.loc, collect_composes);
+          collect_nested_deps!(deps, style.rules);
+        } else if let CssRule::Container(container) = rule {
+          if has_dashed_idents {
+            for name in visit_container_condition_vars(&mut container.condition) {
+              if let Some(result) = bundler.add_css_module_dep(
+                file,
+                import_rule,
+                container.loc,
+                // TODO: store loc in variable reference?
+                crate::dependencies::Location {
+                  line: container.loc.line,
+                  column: container.loc.column,
+                },
+                &mut name.from,
+              ) {
+                deps.push(result?);
+              }
+            }
+
+            collect_nested_deps!(deps, container.rules);
+          }
+        } else {
+          match rule {
+            CssRule::Media(media) => collect_nested_deps!(deps, media.rules),
+            CssRule::Supports(supports) => collect_nested_deps!(deps, supports.rules),
+            CssRule::LayerBlock(layer) => collect_nested_deps!(deps, layer.rules),
+            CssRule::Scope(scope) => collect_nested_deps!(deps, scope.rules),
+            CssRule::StartingStyle(starting_style) => collect_nested_deps!(deps, starting_style.rules),
+            CssRule::NestedDeclarations(nested) => collect_decl_deps!(deps, &mut nested.declarations, nested.loc, false),
+            _ => (),
+          }
+        }
+
+        Ok(deps)
+      })
+      .collect::<Result<Vec<Vec<u32>>, _>>()?
+      .into_iter()
+      .flatten()
+      .collect(),
+  )
 }
 
 #[cfg(test)]
@@ -809,6 +939,7 @@ mod tests {
     targets::{Browsers, Targets},
   };
   use indoc::indoc;
+  use pretty_assertions::assert_eq;
   use std::collections::HashMap;
 
   #[derive(Clone)]
@@ -1907,6 +2038,43 @@ mod tests {
             color: rgb(255 255 255 / var(--opacity from "./b.css"));
             width: env(--env, var(--env-fallback from "./env.css"));
           }
+
+          @layer foo {
+            .layered {
+              @container style(--bg: var(--bg from "./b.css")) {
+                background: var(--bg from "./b.css", var(--fallback from "./b.css"));
+                --components: 255 255 255;
+                color: rgb(var(--components) / var(--opacity from "./b.css"));
+                width: env(--env, var(--env-fallback from "./env.css"));
+              }
+            }
+          }
+
+          :root {
+            @media (min-width: 600px) {
+              .a { background: var(--bg from "./b.css"); }
+            }
+
+            @supports (display: flex) {
+              .a { background: var(--bg from "./b.css"); }
+            }
+
+            @container (min-width: 300px) {
+              .a { background: var(--bg from "./b.css"); }
+            }
+
+            @layer components {
+              .a { background: var(--bg from "./b.css"); }
+            }
+
+            @scope (.scope-root) {
+              .a { background: var(--bg from "./b.css"); }
+            }
+
+            @starting-style {
+              .a { background: var(--bg from "./b.css"); }
+            }
+          }
         "#,
           "/b.css": r#"
           .b {
@@ -1925,6 +2093,7 @@ mod tests {
       "/a.css",
       None,
     );
+
     assert_eq!(
       code,
       indoc! { r#"
@@ -1943,12 +2112,65 @@ mod tests {
         color: rgb(255 255 255 / var(--_8Cs9ZG_opacity));
         width: env(--_6lixEq_env, var(--GbJUva_env-fallback));
       }
+
+      @layer foo {
+        ._6lixEq_layered {
+          @container style(--_6lixEq_bg: var(--_8Cs9ZG_bg)) {
+            background: var(--_8Cs9ZG_bg, var(--_8Cs9ZG_fallback));
+            --_6lixEq_components: 255 255 255;
+            color: rgb(var(--_6lixEq_components) / var(--_8Cs9ZG_opacity));
+            width: env(--_6lixEq_env, var(--GbJUva_env-fallback));
+          }
+        }
+      }
+
+      :root {
+        @media (width >= 600px) {
+          & ._6lixEq_a {
+            background: var(--_8Cs9ZG_bg);
+          }
+        }
+
+        @supports (display: flex) {
+          & ._6lixEq_a {
+            background: var(--_8Cs9ZG_bg);
+          }
+        }
+
+        @container (width >= 300px) {
+          & ._6lixEq_a {
+            background: var(--_8Cs9ZG_bg);
+          }
+        }
+
+        @layer components {
+          & ._6lixEq_a {
+            background: var(--_8Cs9ZG_bg);
+          }
+        }
+
+        @scope (._6lixEq_scope-root) {
+          & ._6lixEq_a {
+            background: var(--_8Cs9ZG_bg);
+          }
+        }
+
+        @starting-style {
+          & ._6lixEq_a {
+            background: var(--_8Cs9ZG_bg);
+          }
+        }
+      }
     "#}
     );
     assert_eq!(
       flatten_exports(exports),
       map! {
         "a" => "_6lixEq_a",
+        "layered" => "_6lixEq_layered",
+        "scope-root" => "_6lixEq_scope-root",
+        "--bg" => "--_6lixEq_bg",
+        "--components" => "--_6lixEq_components",
         "--env" => "--_6lixEq_env"
       }
     );
