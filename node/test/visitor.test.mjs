@@ -1043,7 +1043,7 @@ test('media query raw', () => {
       Rule: {
         custom: {
           breakpoints({ body, loc }) {
-            /** @type {import('lightningcss').ReturnedRule[]} */
+            /** @type {import('@kizu/lightningcss').ReturnedRule[]} */
             const value = [];
 
             for (let rule of body.value) {
